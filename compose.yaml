@@ -1,0 +1,8 @@
+services:
+  xianyu-mcp:
+    build: .
+    restart: unless-stopped
+    env_file:
+      - .env
+    ports:
+      - "127.0.0.1:8001:8001"
