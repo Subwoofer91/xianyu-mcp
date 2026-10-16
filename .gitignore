@@ -1,3 +1,4 @@
+.browser-profile/
 __pycache__/
 *.py[cod]
 *.log
@@ -7,6 +8,5 @@ __pycache__/
 htmlcov/
 .env
 .env.*
-!.env.example
 .venv/
 venv/

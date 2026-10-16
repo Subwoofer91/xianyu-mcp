@@ -6,120 +6,86 @@ import unittest
 from pathlib import Path
 
 
-SERVER_PATH = Path(__file__).parents[1] / "server.py"
-SPEC = importlib.util.spec_from_file_location("xianyu_server", SERVER_PATH)
+PROJECT_ROOT = Path(__file__).parents[1]
+sys.path.insert(0, str(PROJECT_ROOT))
+ENGINE_PATH = PROJECT_ROOT / "browser_engine.py"
+SPEC = importlib.util.spec_from_file_location("browser_engine", ENGINE_PATH)
 assert SPEC and SPEC.loader
-MODULE = importlib.util.module_from_spec(SPEC)
-sys.modules[SPEC.name] = MODULE
-SPEC.loader.exec_module(MODULE)
+ENGINE = importlib.util.module_from_spec(SPEC)
+sys.modules[SPEC.name] = ENGINE
+SPEC.loader.exec_module(ENGINE)
 
 
-def result_page(url: str, title: str, snippet: str) -> str:
-    return f'''<ul class="result"><li class="res-list">
-    <h3 class="res-title"><a href="https://www.so.com/link?x=1"
-    data-mdurl="{url}">{title}</a></h3>
-    <p class="res-desc">{snippet}</p>
-    </li></ul>'''
+class BrowserEngineTests(unittest.TestCase):
+    def test_builds_all_search_links(self) -> None:
+        for platform in ENGINE.PLATFORM_KEYS:
+            url = ENGINE.build_search_link(platform, "静音 游戏鼠标")
+            self.assertTrue(url.startswith("https://"))
+            self.assertIn("%E9%9D%99%E9%9F%B3", url)
 
+    def test_normalizes_platforms_and_rejects_unknown(self) -> None:
+        self.assertEqual(ENGINE.normalize_platforms(["JD", "jd"]), ["jd"])
+        with self.assertRaises(ValueError):
+            ENGINE.normalize_platforms(["amazon"])
 
-class XianyuMcpTests(unittest.TestCase):
-    def test_builds_official_search_link(self) -> None:
-        payload = MODULE.build_xianyu_search_link("静音 游戏鼠标")
-        self.assertEqual(payload["platform"], "xianyu")
-        self.assertIn("www.goofish.com/search?", payload["url"])
-        self.assertIn("%E9%9D%99%E9%9F%B3", payload["url"])
-        self.assertFalse(payload["login_required"])
-
-    def test_parses_current_item_link(self) -> None:
-        payload = MODULE.parse_xianyu_item_link(
-            "https://www.goofish.com/item?id=987654321"
+    def test_parses_xianyu_link(self) -> None:
+        result = ENGINE.parse_product_link(
+            "https://www.goofish.com/item?spm=test&id=1090520463460"
         )
-        self.assertTrue(payload["recognized"])
-        self.assertEqual(payload["item_id"], "987654321")
+        self.assertTrue(result["recognized"])
+        self.assertEqual(result["platform"], "xianyu")
         self.assertEqual(
-            payload["canonical_url"],
-            "https://www.goofish.com/item?id=987654321",
+            result["canonical_url"],
+            "https://www.goofish.com/item?id=1090520463460",
         )
 
-    def test_parses_legacy_item_link(self) -> None:
-        payload = MODULE.parse_xianyu_item_link(
-            "https://2.taobao.com/item.htm?id=123456789"
-        )
-        self.assertTrue(payload["recognized"])
-        self.assertEqual(payload["item_id"], "123456789")
-
-    def test_rejects_deceptive_hostname(self) -> None:
-        payload = MODULE.parse_xianyu_item_link(
-            "https://www.goofish.com.example.org/item?id=123"
-        )
-        self.assertFalse(payload["recognized"])
-
-    def test_parses_price_condition_tags_and_direct_link(self) -> None:
-        page = result_page(
-            "https://www.goofish.com/item?id=987654321",
-            "罗技 GPW 二代静音微动 - 闲鱼",
-            (
-                "2026年10月10日 个人自用99新，原价899元，"
-                "闲鱼价499元，支持验货宝、包邮，可小刀。"
+    def test_parses_taobao_tmall_jd_and_pinduoduo(self) -> None:
+        cases = {
+            "https://item.taobao.com/item.htm?id=123": ("taobao", "123"),
+            "https://detail.tmall.com/item.htm?id=456": ("taobao", "456"),
+            "https://item.jd.com/789.html?utm=x": ("jd", "789"),
+            "https://mobile.yangkeduo.com/goods.html?goods_id=321&page=1": (
+                "pinduoduo", "321"
             ),
+        }
+        for url, expected in cases.items():
+            with self.subTest(url=url):
+                result = ENGINE.parse_product_link(url)
+                self.assertTrue(result["recognized"])
+                self.assertEqual((result["platform"], result["item_id"]), expected)
+
+    def test_rejects_deceptive_hostname_and_non_product_page(self) -> None:
+        self.assertFalse(
+            ENGINE.parse_product_link(
+                "https://item.jd.com.example.org/123.html"
+            )["recognized"]
         )
-        results = MODULE._parse_index_results(page, "direct", 5, 600)
-        self.assertEqual(len(results), 1)
-        item = results[0]
-        self.assertEqual(item["displayed_price_cny"], 499.0)
-        self.assertEqual(item["original_or_purchase_price_cny"], 899.0)
-        self.assertEqual(item["item_id"], "987654321")
-        self.assertEqual(item["link_type"], "direct_item")
-        self.assertIn("99新", item["condition_tags"])
-        self.assertIn("个人自用", item["condition_tags"])
-        self.assertIn("验货宝", item["transaction_tags"])
-        self.assertIn("包邮", item["transaction_tags"])
-        self.assertIn("可议价", item["transaction_tags"])
-        self.assertTrue(item["matches_budget"])
+        self.assertFalse(
+            ENGINE.parse_product_link("https://www.jd.com/")["recognized"]
+        )
 
-    def test_specific_unopened_condition_suppresses_duplicate_generic_tags(self) -> None:
-        self.assertEqual(MODULE._condition_labels("全新未拆封"), ["全新未拆"])
-
-    def test_budget_excludes_known_over_budget_result(self) -> None:
-        page = result_page(
-            "https://www.goofish.com/item?id=1",
-            "游戏鼠标 - 闲鱼",
-            "闲鱼价699元",
+    def test_extracts_price_promotions_images_and_canonical_link(self) -> None:
+        listing = ENGINE.listing_from_dom(
+            "xianyu",
+            "https://www.goofish.com/item?spm=track&id=1090520463460",
+            "iPhone 13 mini 国行原装 电池90% ¥ 1709 包邮 支持验货宝",
+            ["//img.alicdn.com/main.webp", "https://img.alicdn.com/second.webp"],
+        )
+        assert listing
+        self.assertEqual(listing["displayed_price_cny"], 1709.0)
+        self.assertIn("包邮", listing["general_promotions"])
+        self.assertIn("验货宝", listing["general_promotions"])
+        self.assertEqual(
+            listing["item_url"],
+            "https://www.goofish.com/item?id=1090520463460",
         )
         self.assertEqual(
-            MODULE._parse_index_results(page, "direct", 5, 500), []
+            listing["main_image_url"],
+            "https://img.alicdn.com/main.webp",
         )
 
-    def test_discovery_result_must_name_xianyu(self) -> None:
-        page = result_page(
-            "https://www.smzdm.com/p/1234/",
-            "二手鼠标价格",
-            "其他平台售价99元",
-        )
-        self.assertEqual(
-            MODULE._parse_index_results(page, "discovery", 5), []
-        )
-
-    def test_public_source_can_supply_indexed_price(self) -> None:
-        page = result_page(
-            "https://www.smzdm.com/p/1234/",
-            "闲鱼二手显卡行情",
-            "2026年10月1日 闲鱼价1200元，支持同城自提。",
-        )
-        item = MODULE._parse_index_results(page, "discovery", 5)[0]
-        self.assertEqual(item["displayed_price_cny"], 1200.0)
-        self.assertIsNone(item["item_url"])
-        self.assertEqual(item["link_type"], "public_source")
-        self.assertIn("同城自提", item["transaction_tags"])
-
-    def test_http_item_link_is_upgraded_to_https(self) -> None:
-        page = result_page(
-            "http://www.goofish.com/item?id=42",
-            "闲鱼测试商品",
-            "售价88元",
-        )
-        item = MODULE._parse_index_results(page, "direct", 5)[0]
-        self.assertEqual(item["item_url"], "https://www.goofish.com/item?id=42")
+    def test_fallback_price_text(self) -> None:
+        self.assertEqual(ENGINE.extract_price("券后价 88.20 元"), 88.2)
 
 
 if __name__ == "__main__":
