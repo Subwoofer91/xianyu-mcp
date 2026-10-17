@@ -24,10 +24,18 @@
 
 ## 工作方式
 
-项目使用 Playwright 驱动本机已安装的 Google Chrome，并使用仓库内的
-`.browser-profile` 作为专用持久化配置。普通 Chrome 的现有登录不会被自动复制；第一次使用时，
-你需要在这个专用 Chrome 窗口中登录一次。之后 MCP 默认复用这个可见的 Chrome，便于网站
-正常识别浏览器并让你处理偶发验证；关闭 MCP 进程时该窗口会一并关闭。
+项目先以普通方式启动本机 Google Chrome，只增加绑定到 `127.0.0.1` 的 DevTools 端口；
+随后 Playwright 通过 CDP 连接这个已经运行的浏览器。它不会使用
+`--enable-automation`、`--remote-debugging-pipe` 或 `--no-sandbox`，从而减少京东等平台
+把浏览器判定为自动化测试环境的概率。
+
+这里的 Playwright 只作为 CDP/DOM 客户端使用：不使用 Codex Computer Use，不读取截图做视觉
+定位，也不模拟鼠标或键盘点击。搜索结果直接从页面 DOM、商品卡片运行时数据和官方链接中读取；
+账号登录与验证码始终由用户在普通 Chrome 中手动完成。
+
+Chrome 使用仓库内的 `.browser-profile` 作为专用持久化配置。日常 Chrome 的现有登录不会被
+自动复制；第一次使用时，需要在这个专用普通 Chrome 中登录一次。MCP 退出后 Chrome 可以继续
+运行，后续工具调用会重新连接它。
 
 这样做可以避免读取或破坏日常 Chrome 配置，也避免把 Cookie 复制到云端。`.browser-profile`
 已被 `.gitignore` 排除，绝不能提交、打包或分享。
@@ -48,8 +56,8 @@ conda run -n playground python -m pip install -r requirements.txt
 conda run -n playground python login_browser.py
 ```
 
-脚本会打开四个标签页。请在浏览器中手动登录并完成网站要求的验证，再回终端按 Enter。
-密码、短信验证码和扫码过程都不会进入 MCP。
+脚本会用普通 Chrome 打开四个标签页后立即退出。请在浏览器中手动登录并完成网站要求的验证，
+然后保持该 Chrome 运行。密码、短信验证码和扫码过程都不会进入 MCP。
 
 只更新部分平台也可以：
 
@@ -83,12 +91,12 @@ conda run -n playground python server.py --live-test "iPhone 13 mini"
 ## 可选配置
 
 - `ECOMMERCE_BROWSER_PROFILE`：专用 Chrome profile 目录。
-- `ECOMMERCE_BROWSER_CHANNEL`：Playwright 浏览器频道，默认 `chrome`。
-- `ECOMMERCE_BROWSER_HEADLESS=1`：改为无头运行；默认显示浏览器。部分平台会拒绝无头浏览器，
-  因此只建议在确认当前站点可用时开启。
-- `ECOMMERCE_CDP_URL`：高级用法，连接到你自行启动并保护好的 Chrome DevTools 地址。
+- `ECOMMERCE_CHROME_EXECUTABLE`：本机 `chrome.exe` 的绝对路径；通常会自动发现。
+- `ECOMMERCE_CDP_PORT`：本地 DevTools 端口，默认 `9223`。
+- `ECOMMERCE_CDP_URL`：高级用法，连接到你自行启动的本机 Chrome；只接受 loopback HTTP 地址。
 
-不要把 CDP 端口暴露到局域网或公网；它等同于远程控制浏览器和登录账号。
+不要把 CDP 端口暴露到局域网或公网；它等同于远程控制浏览器和登录账号。本项目固定使用
+`--remote-debugging-address=127.0.0.1`，并拒绝配置非 loopback 的 CDP 地址。
 
 ## 价格与优惠边界
 
@@ -102,6 +110,9 @@ conda run -n playground python server.py --live-test "iPhone 13 mini"
 - `verification_required`：下单前仍需核对选中 SKU、优惠资格、运费和结算页。
 
 如果登录失效或触发风控，工具会返回 `login_required` 或 `challenge_required`，不会尝试绕过。
+若详情页主动隐藏价格（例如拼多多显示 `1??9.??` 并要求前往 App），工具会返回
+`displayed_price_cny: null` 和 `price_kind: masked_or_unavailable`，而不会把掩码误报为 1 元；
+此时可参考同一次搜索返回的商品卡片价格，并在下单前再次核对。
 
 ## License
 

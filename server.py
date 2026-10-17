@@ -3,6 +3,7 @@ from __future__ import annotations
 import argparse
 import asyncio
 import json
+import sys
 from typing import Any
 
 from mcp.server.fastmcp import FastMCP
@@ -186,6 +187,8 @@ def build_xianyu_search_link(keyword: str) -> dict[str, Any]:
 async def _live_test(keyword: str) -> int:
     try:
         payload = await search_products(keyword, list(PLATFORM_KEYS), 3)
+        if hasattr(sys.stdout, "reconfigure"):
+            sys.stdout.reconfigure(encoding="utf-8")
         print(json.dumps(payload, ensure_ascii=False, indent=2))
         return 0 if payload["platforms"] else 2
     finally:

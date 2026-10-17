@@ -1,15 +1,15 @@
 from __future__ import annotations
 
 import asyncio
-import os
 import re
 from dataclasses import dataclass
 from datetime import datetime
-from pathlib import Path
 from typing import Any
 from urllib.parse import parse_qs, quote, urlparse
 
 from playwright.async_api import Browser, BrowserContext, Page, Playwright, async_playwright
+
+from local_chrome import configured_cdp_url, ensure_chrome_cdp, profile_dir
 
 
 @dataclass(frozen=True)
@@ -35,13 +35,13 @@ PLATFORMS: dict[str, Platform] = {
     ),
     "jd": Platform(
         "jd", "京东", "https://search.jd.com/Search?keyword={query}",
-        "https://www.jd.com/", ("jd.com",), 'a[href*="item.jd.com/"]',
+        "https://www.jd.com/", ("jd.com",), "[data-sku]",
     ),
     "pinduoduo": Platform(
         "pinduoduo", "拼多多",
         "https://mobile.yangkeduo.com/search_result.html?search_key={query}",
         "https://mobile.yangkeduo.com/", ("yangkeduo.com", "pinduoduo.com"),
-        'a[href*="goods.html"], a[href*="goods_id="]',
+        'img[src*="mms-goods-image"]',
     ),
 }
 PLATFORM_KEYS = tuple(PLATFORMS)
@@ -51,13 +51,17 @@ FALLBACK_PRICE_PATTERN = re.compile(
     r"(?:到手价|券后价|现价|售价|价格)[^\d]{0,8}(\d{1,8}(?:\.\d{1,2})?)"
 )
 PROMOTION_WORDS = (
-    "满减", "优惠券", "平台券", "店铺券", "补贴", "百亿补贴", "直降",
-    "秒杀", "限时", "包邮", "跨店", "以旧换新", "赠品", "验货宝",
-    "可议价", "小刀",
+    "满减", "优惠券", "平台券", "店铺券", "券后", "优惠后", "到手价",
+    "补贴", "百亿补贴", "直降", "立减", "秒杀", "限时", "包邮",
+    "跨店", "以旧换新", "赠品", "验货宝", "可议价", "小刀",
 )
-LOGIN_MARKERS = ("登录", "扫码", "请使用手机闲鱼")
+LOGIN_MARKERS = (
+    "请登录", "扫码登录", "账号登录", "短信登录", "登录后查看",
+    "登录后继续", "立即登录", "登录/注册", "请使用手机闲鱼",
+)
 CHALLENGE_MARKERS = (
-    "滑动验证", "安全验证", "访问过于频繁", "验证码", "异常访问", "非法访问"
+    "滑动验证", "安全验证", "访问过于频繁", "验证码", "异常访问", "访问异常",
+    "当前页面异常", "系统检测到当前访问存在异常", "非法访问",
 )
 
 
@@ -182,11 +186,31 @@ def extract_promotions(text: str) -> list[str]:
     return [word for word in PROMOTION_WORDS if word in text]
 
 
+def normalize_card_text(text: str) -> str:
+    cleaned = " ".join(text.split())
+    return re.sub(r"(?<=\d)\s*\.\s*(?=\d)", ".", cleaned)
+
+
+def extract_detail_price(platform: str, price_contexts: list[str], visible_text: str) -> float | None:
+    normalized_contexts = [normalize_card_text(value) for value in price_contexts]
+    if platform == "pinduoduo":
+        if re.search(r"[¥￥]\s*[\d?]*\?", visible_text):
+            return None
+        return extract_price(visible_text) or extract_price(" ".join(normalized_contexts))
+    if platform == "xianyu":
+        for context in normalized_contexts:
+            if re.fullmatch(r"\d{1,8}(?:\.\d{1,2})?", context):
+                value = float(context)
+                if 0 < value < 10_000_000:
+                    return value
+    return extract_price(" ".join(normalized_contexts)) or extract_price(visible_text)
+
+
 def listing_from_dom(platform: str, href: str, text: str, images: list[str]) -> dict[str, Any] | None:
     parsed = parse_product_link(href)
     if not parsed["recognized"]:
         return None
-    cleaned = " ".join(text.split())
+    cleaned = normalize_card_text(text)
     if not cleaned:
         return None
     price = extract_price(cleaned)
@@ -213,19 +237,6 @@ def listing_from_dom(platform: str, href: str, text: str, images: list[str]) -> 
     }
 
 
-def _profile_dir() -> Path:
-    configured = os.environ.get("ECOMMERCE_BROWSER_PROFILE", "").strip()
-    return (
-        Path(configured).expanduser().resolve()
-        if configured
-        else Path(__file__).with_name(".browser-profile")
-    )
-
-
-def _headless() -> bool:
-    return os.environ.get("ECOMMERCE_BROWSER_HEADLESS", "0").strip().lower() not in {"0", "false", "no"}
-
-
 class BrowserController:
     def __init__(self) -> None:
         self._lock = asyncio.Lock()
@@ -238,21 +249,11 @@ class BrowserController:
             if self._context is not None:
                 return self._context
             self._playwright = await async_playwright().start()
-            cdp_url = os.environ.get("ECOMMERCE_CDP_URL", "").strip()
-            if cdp_url:
-                self._browser = await self._playwright.chromium.connect_over_cdp(cdp_url)
-                if not self._browser.contexts:
-                    raise RuntimeError("The CDP browser has no usable context.")
-                self._context = self._browser.contexts[0]
-                return self._context
-
-            profile = _profile_dir()
-            profile.mkdir(parents=True, exist_ok=True)
-            channel = os.environ.get("ECOMMERCE_BROWSER_CHANNEL", "chrome").strip() or "chrome"
-            self._context = await self._playwright.chromium.launch_persistent_context(
-                user_data_dir=str(profile), channel=channel, headless=_headless(),
-                locale="zh-CN", viewport={"width": 1440, "height": 1000},
-            )
+            cdp_url = await asyncio.to_thread(ensure_chrome_cdp)
+            self._browser = await self._playwright.chromium.connect_over_cdp(cdp_url)
+            if not self._browser.contexts:
+                raise RuntimeError("The CDP browser has no usable context.")
+            self._context = self._browser.contexts[0]
             return self._context
 
     async def new_page(self) -> Page:
@@ -260,8 +261,6 @@ class BrowserController:
 
     async def close(self) -> None:
         async with self._lock:
-            if self._context is not None and not os.environ.get("ECOMMERCE_CDP_URL", "").strip():
-                await self._context.close()
             if self._playwright is not None:
                 await self._playwright.stop()
             self._context = None
@@ -298,15 +297,111 @@ async def browser_status_payload() -> dict[str, Any]:
             "session_cookie_present": bool(cookies),
         })
     return {
-        "status": "ok", "profile_dir": str(_profile_dir()), "headless": _headless(),
+        "status": "ok",
+        "connection_mode": "plain_chrome_loopback_cdp",
+        "profile_dir": str(profile_dir()),
+        "cdp_url": configured_cdp_url(),
         "platforms": statuses,
-        "note": "Cookie values are never returned. Presence is not proof that a session is still valid.",
+        "note": (
+            "Cookie values are never returned. Presence is not proof that a session is still valid. "
+            "The CDP endpoint is restricted to this computer's loopback interface."
+        ),
     }
 
 
 async def _goto(page: Page, url: str) -> None:
     await page.goto(url, wait_until="domcontentloaded", timeout=35_000)
     await page.wait_for_timeout(2_000)
+
+
+async def _wait_for_cards(page: Page, selector: str) -> None:
+    try:
+        await page.locator(selector).first.wait_for(state="attached", timeout=8_000)
+    except Exception:
+        # Some marketplace pages legitimately return an empty result set. State and
+        # extraction below distinguish that from login and challenge pages.
+        pass
+
+
+async def _extract_raw_items(page: Page, platform_key: str) -> list[dict[str, Any]]:
+    if platform_key == "pinduoduo":
+        return await page.evaluate(
+            """() => {
+                const seenCards = new Set();
+                const cards = Array.from(document.images)
+                    .filter((img) => /mms-goods-image/.test(img.currentSrc || img.src || ''))
+                    .map((img) => img.closest('[data-uniqid]'))
+                    .filter((card) => card && !seenCards.has(card) && seenCards.add(card));
+                const findGoods = (root) => {
+                    const stack = [root];
+                    const seen = new WeakSet();
+                    let visited = 0;
+                    while (stack.length && visited++ < 300) {
+                        const value = stack.pop();
+                        if (!value || typeof value !== 'object' || seen.has(value)) continue;
+                        seen.add(value);
+                        if ((value.goodsID || value.goodsId || value.goods_id) &&
+                            (value.goodsName || value.title || value.name)) return value;
+                        for (const child of Object.values(value)) {
+                            if (child && typeof child === 'object') stack.push(child);
+                        }
+                    }
+                    return null;
+                };
+                return cards.slice(0, 120).map((card) => {
+                    let goods = null;
+                    for (const key of Object.getOwnPropertyNames(card)) {
+                        if (key.startsWith('__reactProps$') || key.startsWith('__reactFiber$')) {
+                            goods = findGoods(card[key]);
+                            if (goods) break;
+                        }
+                    }
+                    if (!goods) return null;
+                    const id = goods.goodsID || goods.goodsId || goods.goods_id;
+                    const price = goods.priceInfo ||
+                        (Number.isFinite(Number(goods.price)) ? String(Number(goods.price) / 100) : '');
+                    const text = [
+                        goods.goodsName || goods.title || goods.name,
+                        goods.pricePrefixInfo || goods.priceDesc,
+                        price ? `¥${price}` : '',
+                        goods.salesTip,
+                        card.innerText || card.textContent || '',
+                    ].filter(Boolean).join(' ');
+                    const image = goods.imgUrl || goods.imageUrl ||
+                        card.querySelector('img')?.currentSrc || card.querySelector('img')?.src || '';
+                    return {
+                        href: `https://mobile.yangkeduo.com/goods.html?goods_id=${id}`,
+                        text,
+                        images: image ? [image] : [],
+                    };
+                }).filter(Boolean);
+            }"""
+        )
+
+    if platform_key == "jd":
+        return await page.locator(PLATFORMS[platform_key].item_selector).evaluate_all(
+            """(cards) => cards.slice(0, 120).map((card) => {
+                const sku = card.getAttribute('data-sku');
+                const images = Array.from(card.querySelectorAll('img'))
+                    .map((img) => img.currentSrc || img.src || img.getAttribute('data-lazy-img') || '')
+                    .filter(Boolean);
+                return {
+                    href: sku ? `https://item.jd.com/${sku}.html` : '',
+                    text: (card.innerText || card.textContent || '').trim(),
+                    images,
+                };
+            })"""
+        )
+
+    return await page.locator(PLATFORMS[platform_key].item_selector).evaluate_all(
+        """(anchors) => anchors.slice(0, 120).map((anchor) => ({
+            href: anchor.href,
+            text: (anchor.innerText || anchor.textContent || anchor.getAttribute('aria-label') || '').trim(),
+            images: Array.from(anchor.querySelectorAll('img'))
+                .map((img) => img.currentSrc || img.src || img.getAttribute('data-src') || '')
+                .filter(Boolean),
+        }))"""
+    )
 
 
 async def search_platform(
@@ -318,6 +413,7 @@ async def search_platform(
     try:
         page = await _controller.new_page()
         await _goto(page, search_url)
+        await _wait_for_cards(page, config.item_selector)
         status, body_text = await _page_state(page)
         if status != "ok":
             return {
@@ -325,14 +421,7 @@ async def search_platform(
                 "status": status, "search_url": page.url, "listings": [],
                 "note": "Run login_browser.py and complete any verification in the dedicated Chrome profile.",
             }
-        raw_items = await page.locator(config.item_selector).evaluate_all(
-            """(anchors) => anchors.slice(0, 120).map((a) => {
-                const card = a.closest('li, article, [class*="card"], [class*="item"], [class*="goods"], [data-sku]') || a;
-                const text = (card.innerText || a.innerText || a.getAttribute('aria-label') || '').trim();
-                const images = Array.from(card.querySelectorAll('img')).map((img) => img.currentSrc || img.src || img.getAttribute('data-src') || '').filter(Boolean);
-                return {href: a.href, text, images};
-            })"""
-        )
+        raw_items = await _extract_raw_items(page, platform_key)
         listings: list[dict[str, Any]] = []
         seen: set[str] = set()
         for raw in raw_items:
@@ -397,13 +486,22 @@ async def inspect_product_page(url: str, max_images: int) -> dict[str, Any]:
             """() => {
                 const meta = (name) => document.querySelector(`meta[property="${name}"], meta[name="${name}"]`)?.content || '';
                 const heading = document.querySelector('h1')?.innerText || '';
+                const pddTitle = Array.from(document.querySelectorAll('span')).map((el) => ({
+                    text: (el.innerText || el.textContent || '').trim(),
+                    top: el.getBoundingClientRect().top,
+                    visible: getComputedStyle(el).display !== 'none' && getComputedStyle(el).visibility !== 'hidden',
+                })).filter((item) => item.visible && item.top >= 0 && item.text.length >= 15 &&
+                    item.text.length <= 300 && !item.text.includes('\\n') &&
+                    !/退货包运费|无门槛|恢复原价|拼单即将结束|不满意包|^已选[：:]/.test(item.text))
+                    .sort((a, b) => a.top - b.top)[0]?.text || '';
                 const images = Array.from(document.images).filter((img) => img.naturalWidth >= 160 && img.naturalHeight >= 120).map((img) => img.currentSrc || img.src).filter(Boolean);
                 const priceTexts = Array.from(document.querySelectorAll('[data-price], [class*="price" i]')).filter((el) => {
                     const style = getComputedStyle(el);
                     return style.visibility !== 'hidden' && style.display !== 'none';
                 }).map((el) => `${el.getAttribute('data-price') || ''} ${el.innerText || el.textContent || ''}`.trim()).filter(Boolean).slice(0, 100);
                 const selectedOptions = Array.from(document.querySelectorAll('[aria-selected="true"], [aria-checked="true"], [class*="selected" i], [class*="checked" i]')).map((el) => (el.innerText || el.textContent || '').trim()).filter((text) => text && text.length <= 120).slice(0, 50);
-                return {title: meta('og:title') || heading || document.title,
+                return {title: meta('og:title') || meta('twitter:title') || document.title || heading,
+                    pddTitle,
                     description: meta('og:description') || meta('description'),
                     ogImage: meta('og:image'), images, priceTexts, selectedOptions,
                     visibleText: ((document.querySelector('main, [role="main"]') || document.body)?.innerText || '').slice(0, 20000)};
@@ -420,17 +518,23 @@ async def inspect_product_page(url: str, max_images: int) -> dict[str, Any]:
             if len(images) >= max_images:
                 break
         price_contexts = [" ".join(str(value).split()) for value in data.get("priceTexts", [])]
-        price_text = " ".join(price_contexts)
+        title = normalize_card_text(str(data.get("title", "")))[:500]
+        if platform == "pinduoduo" and title in {"拼多多", "拼多多商城"}:
+            title = normalize_card_text(str(data.get("pddTitle", "")))[:500] or title
+        displayed_price = extract_detail_price(platform, price_contexts, visible_text)
         return {
             "platform": platform, "platform_name": PLATFORMS[platform].name,
             "status": status, "item_id": parsed["item_id"],
             "item_url": parsed["canonical_url"], "final_url": page.url,
-            "title": " ".join(str(data.get("title", "")).split())[:500],
+            "title": title,
             "description": " ".join(str(data.get("description", "")).split())[:2000],
-            "displayed_price_cny": extract_price(price_text) or extract_price(visible_text),
-            "all_price_candidates_cny": extract_prices(price_text),
+            "displayed_price_cny": displayed_price,
+            "all_price_candidates_cny": extract_prices(" ".join(price_contexts)),
             "price_contexts": price_contexts[:30],
-            "price_kind": "logged_in_product_page_observation",
+            "price_kind": (
+                "logged_in_product_page_observation"
+                if displayed_price is not None else "masked_or_unavailable"
+            ),
             "general_promotions": extract_promotions(visible_text),
             "image_urls": images,
             "selected_options_or_states": list(dict.fromkeys(data.get("selectedOptions", [])))[:30],
